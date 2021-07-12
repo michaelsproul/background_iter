@@ -1,38 +1,25 @@
-use futures::stream::Stream;
-use futures::task::{Context, Poll};
-use std::pin::Pin;
-use tokio::runtime::Runtime;
-use tokio::sync::mpsc::channel;
-use tokio::task::JoinHandle;
-use tokio_stream::wrappers::ReceiverStream;
+use std::sync::mpsc::{sync_channel, Receiver};
 
 pub struct Results<T> {
-    stream: ReceiverStream<T>,
-    _join_handle: JoinHandle<()>,
+    recv: Receiver<T>,
 }
 
 pub trait BackgroundIterator<T>: Iterator<Item = T> + Send + Sized + 'static
 where
     T: Send + 'static,
 {
-    // TODO: allow using different backends, e.g. dedicated OS thread, rayon thread pool, etc.
-    fn run_in_background(self, runtime: &Runtime, queue_bound: usize) -> Results<T> {
-        let (sender, recv) = channel(queue_bound);
+    fn run_in_background(self, queue_bound: usize) -> Results<T> {
+        let (sender, recv) = sync_channel(queue_bound);
 
-        let _join_handle = runtime.spawn_blocking(move || {
+        rayon::spawn(move || {
             for item in self {
-                if let Err(e) = sender.blocking_send(item) {
-                    println!("error during iteration: {}", e);
+                if sender.send(item).is_err() {
                     break;
                 }
             }
         });
 
-        let stream = ReceiverStream::new(recv);
-        Results {
-            stream,
-            _join_handle,
-        }
+        Results { recv }
     }
 }
 
@@ -43,20 +30,20 @@ where
 {
 }
 
-// TODO: implement a fully-blocking version (impl Iterator).
-// Compute-heavy tasks shouldn't run async on the Tokio executor anyway.
-impl<T> Stream for Results<T> {
+impl<T> Iterator for Results<T>
+where
+    T: Send + 'static,
+{
     type Item = T;
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::new(&mut self.stream).poll_next(cx)
+    fn next(&mut self) -> Option<T> {
+        self.recv.recv().ok()
     }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
-    use futures::stream::StreamExt;
     use std::thread::sleep;
     use std::time::{Duration, Instant};
 
@@ -82,35 +69,24 @@ mod test {
 
     #[test]
     fn parallel() {
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-
         let t = Instant::now();
 
-        let load_delay = 5;
-        let process_delay = 5;
+        let load_delay = 7;
+        let process_delay = 10;
 
-        let sleepy = SleepyIter {
+        SleepyIter {
             iter: (0..10u64),
             delay_millis: load_delay,
         }
         .map(|item| {
             println!("processed item {} in the background", item);
             item
-        });
-
-        let sleepy_stream = sleepy.run_in_background(&rt, 1);
-
-        rt.block_on(async move {
-            sleepy_stream
-                .for_each(|item| async move {
-                    // Simulate heavy processing.
-                    tokio::time::sleep(Duration::from_millis(process_delay)).await;
-                    println!("finished processing item {}", item);
-                })
-                .await;
+        })
+        .run_in_background(5)
+        .for_each(|item| {
+            // Simulate heavy processing.
+            sleep(Duration::from_millis(process_delay));
+            println!("finished processing item {}", item);
         });
 
         println!("total time to run: {}ms", t.elapsed().as_millis());

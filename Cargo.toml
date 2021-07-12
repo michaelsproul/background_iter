@@ -4,6 +4,4 @@ version = "0.1.0"
 edition = "2018"
 
 [dependencies]
-tokio = { version = "1.8.1", features = ["rt", "rt-multi-thread", "sync", "time"] }
-tokio-stream = "0.1.7"
-futures = "0.3.15"
+rayon = "1.5.1"
